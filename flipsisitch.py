@@ -64,7 +64,7 @@ try:
 except ImportError:
     _HAS_URLPARSE = False
 
-__version__ = "4.0.0"
+__version__ = "0.1.0"
 
 log = logging.getLogger("flipsisitch")
 
