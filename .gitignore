@@ -1,0 +1,41 @@
+# Build artifacts
+build/
+dist/
+__pycache__/
+*.pyc
+*.pyo
+*.spec
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Executables (built via GitHub Actions)
+*.exe
+
+# ffmpeg binaries (downloaded separately)
+ffmpeg.exe
+ffprobe.exe
+ffmpeg
+ffprobe
+
+# Test files
+test_videos/
+*.mp4
+*.mov
+*.avi
+*.mkv
+
+# Generated icons (keep source only)
+icon_transparent.png
+icon_transparent_full.png
+icon_gen.ico
+icon_gen_256.png
+icon_generated.jpg
