@@ -1,7 +1,7 @@
 # FlipsiStitch
 
 [![Version](https://img.shields.io/badge/version-0.1.0-blue.svg)](https://github.com/TechFlipsi/FlipsiStitch/releases)
-[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![License: GPL v3](https://img.shields.io/badge/license-GPL%20v3-blue.svg)](LICENSE)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8%2B-blue.svg)](https://www.python.org/)
 
 **Lossless video segment merging – with color correction, GPU acceleration & modern web UI**
@@ -110,7 +110,7 @@ Requires: Python 3.8+, PyInstaller, ffmpeg (for full build)
 
 - **Idea:** Fabian Kirchweger
 - **Code:** GLM-5.1 (via OpenClaw)
-- **License:** MIT
+- **License:** GPL v3
 
 ## 🤝 Contributing
 
@@ -118,4 +118,4 @@ Contributions are welcome! Please create an Issue or Pull Request.
 
 ## ⚖️ License
 
-[MIT License](LICENSE) – free to use, modify, and distribute.
+[GPL v3 License](LICENSE) – free to use, modify, and distribute, with copyleft conditions.

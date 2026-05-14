@@ -4,7 +4,7 @@
 
 - **Idea:** Fabian Kirchweger
 - **Code:** GLM-5.1 (via OpenClaw)
-- **License:** MIT
+- **License:** GPL v3
 
 ### Third-Party
 

@@ -1,7 +1,7 @@
 # FlipsiStitch
 
 [![Version](https://img.shields.io/badge/version-0.1.0-blue.svg)](https://github.com/TechFlipsi/FlipsiStitch/releases)
-[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![License: GPL v3](https://img.shields.io/badge/license-GPL%20v3-blue.svg)](LICENSE)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8%2B-blue.svg)](https://www.python.org/)
 
 **Verlustfreies Zusammenfügen von Videosegmenten – mit Farbkorrektur, GPU-Beschleunigung & moderner Web-UI**
@@ -110,7 +110,7 @@ Voraussetzung: Python 3.8+, PyInstaller, ffmpeg (für Full-Build)
 
 - **Idee:** Fabian Kirchweger
 - **Code:** GLM-5.1 (via OpenClaw)
-- **Lizenz:** MIT
+- **Lizenz:** GPL v3
 
 ## 🤝 Beitrag leisten
 
@@ -118,4 +118,4 @@ Beiträge sind willkommen! Bitte erstelle ein Issue oder einen Pull Request.
 
 ## ⚖️ Lizenz
 
-[MIT License](LICENSE) – frei verwendbar, modifizierbar und verteilbar.
+[GPL v3 License](LICENSE) – frei verwendbar, modifizierbar und verteilbar, mit Copyleft-Bedingungen.
