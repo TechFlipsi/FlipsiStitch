@@ -6,13 +6,13 @@
 
 **Verlustfreies Zusammenfügen von Videosegmenten – mit Farbkorrektur, GPU-Beschleunigung & moderner Web-UI**
 
-DJI-Kameras (Osmo Action 5 Pro, Pocket 4, Drohnen) splitten lange Videoaufnahmen absichtlich in mehrere Dateien – angeblich wegen Dateisicherheit. FlipsiStitch erkennt diese Segmente automatisch und fügt sie verlustfrei wieder zu einer Datei zusammen.
+Viele Kameras (DJI, GoPro, Sony, Canon und andere) splitten lange Videoaufnahmen automatisch in mehrere Dateien – oft wegen Dateisystem- oder Sicherheitsbeschränkungen. FlipsiStitch erkennt diese Segmente unabhängig vom Hersteller automatisch und fügt sie verlustfrei wieder zu einer Datei zusammen.
 
 ## ✨ Features
 
 - 🎬 **Automatische Segment-Erkennung** – Erkennt DJI, GoPro und alle anderen Kameras anhand fortlaufender Nummern
 - 🔗 **Verlustfreies Mergen** – ffmpeg concat demuxer mit `-c copy` (kein Re-encoding)
-- 🎨 **Farbkorrektur** – D-Log M → Rec.709, automatischer Weißabgleich, oder beides kombiniert
+- 🎨 **Farbkorrektur** – Allgemeine Farbkorrektur für jede Aufnahme, inkl. D-Log M → Rec.709; automatischer Weißabgleich für alle Videos
 - ⚡ **GPU-Beschleunigung** – NVENC (NVIDIA), AMF (AMD), QSV (Intel), VideoToolbox (Mac)
 - 📦 **H.265/HEVC** – Moderner Standard-Codec bei Re-Encoding, ~40% kleinere Dateien
 - 🖥️ **Moderne Web-UI** – Dark Mode, Glasmorphismus, Drag & Drop, Live-Fortschritt
@@ -45,14 +45,16 @@ FlipsiStitch bietet drei Korrektur-Profile:
 | Profil | Beschreibung | Re-Encoding |
 |--------|-------------|-------------|
 | **Keine** (Standard) | Verlustfrei, keine Änderung | Nein (`-c copy`) |
-| **D-Log M → Rec.709** | Konvertiert DJI D-Log M zu normalem Farbraum | Ja (H.265) |
-| **Weißabgleich** | Automatischer White Balance (grayworld) | Ja (H.265) |
-| **D-Log M + Weißabgleich** | Beides kombiniert (empfohlen) | Ja (H.265) |
+| **Farbkorrektur** | Farbkorrektur für alle Aufnahmen – erkennt automatisch D-Log M und wendet die passende Konvertierung an; reguläres Material wird ebenfalls korrigiert | Ja (H.265) |
+| **Weißabgleich** | Automatischer Weißabgleich für jede Aufnahme (grayworld-Algorithmus) | Ja (H.265) |
+| **Farbkorrektur + Weißabgleich** | Beides kombiniert – optimale Farben für jedes Video (empfohlen) | Ja (H.265) |
 
 ### Sicherheit
 
-- D-Log M Konvertierung wird **nur angewendet** wenn das Video tatsächlich D-Log M enthält (automatische Erkennung via ffprobe)
-- Weißabgleich hat Sanity-Checks – wird übersprungen wenn das Ergebnis nicht verlässlich ist
+- Farbkorrektur funktioniert mit **jedem** Video – egal welche Kamera oder welches Farbprofil
+- D-Log M Konvertierung wird **automatisch erkannt** und angewendet wenn das Video D-Log M enthält; andernfalls erfolgt eine allgemeine Farbkorrektur
+- Weißabgleich funktioniert für **alle Aufnahmen** (grayworld-Algorithmus) – nicht nur für bestimmte Kameras
+- Sanity-Checks verhindern fehlerhafte Korrekturen – Weißabgleich wird übersprungen wenn das Ergebnis nicht verlässlich ist
 - `--test-color` extrahiert Frames VOR/NACH der Korrektur zum Vergleich
 
 ## ⚡ GPU-Beschleunigung

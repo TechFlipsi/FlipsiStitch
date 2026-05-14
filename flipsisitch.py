@@ -9,7 +9,7 @@ DJI_20240101120000_0001.MP4, DJI_20240101120000_0002.MP4, …).
 FlipsiStitch erkennt zusammengehörige Segmente automatisch und fügt sie
 verlustfrei per ffmpeg concat demuxer zu einer einzigen Datei zusammen.
 
-NEU: D-Log M → Rec.709 Konvertierung, H.265/HEVC Standard-Codec,
+NEU: Universelle Farbkorrektur (erkennt D-Log M automatisch), H.265/HEVC Standard-Codec,
 GPU-Hardware-Beschleunigung, Auto-Update, Premium Web-UI.
 
 Usage:
@@ -20,8 +20,8 @@ Usage:
     flipsisitch --force --output ./merged    # ohne Rückfrage, in merged/
     flipsisitch --group "DJI_20240101120000" # nur eine Gruppe mergen
     flipsisitch --web                        # Web-UI starten
-    flipsisitch --color-profile dlogm       # D-Log M → Rec.709
-    flipsisitch --color-profile both         # D-Log M + Weißabgleich
+    flipsisitch --color-profile colorcorrect  # Farbkorrektur (auto, erkennt D-Log M)
+    flipsisitch --color-profile both           # Farbkorrektur + Weißabgleich
     flipsisitch --update                     # Auf neueste Version updaten
 """
 
@@ -409,11 +409,20 @@ def _get_whitebalance_filter() -> str:
     return "grayworld=1"
 
 
+def _get_general_color_correction_filter() -> str:
+    """Return ffmpeg filter for general color correction (non-D-Log-M footage).
+    
+    Applies a subtle gamma/contrast/saturation boost to make self-recorded
+    videos look more vibrant without appearing artificial.
+    """
+    return "eq=gamma=1.1:contrast=1.05:saturation=1.08"
+
+
 def _get_color_filter_chain(color_profile: str, is_dlog_m: bool) -> str:
     """Build the complete color filter chain based on profile and D-Log M status.
 
     Args:
-        color_profile: "dlogm", "whitebalance", "both", "none"
+        color_profile: "colorcorrect", "dlogm", "whitebalance", "both", "none"
         is_dlog_m: Whether D-Log M was detected in the source
 
     Returns:
@@ -424,14 +433,11 @@ def _get_color_filter_chain(color_profile: str, is_dlog_m: bool) -> str:
 
     filters = []
 
-    if color_profile in ("dlogm", "both"):
+    if color_profile in ("colorcorrect", "dlogm", "both"):
         if is_dlog_m:
             filters.append(_get_dlog_m_rec709_filter())
         else:
-            log.warning(
-                "D-Log M Profil angefordert, aber Video ist nicht D-Log M – "
-                "übersprungen"
-            )
+            filters.append(_get_general_color_correction_filter())
 
     if color_profile in ("whitebalance", "both"):
         filters.append(_get_whitebalance_filter())
@@ -997,7 +1003,7 @@ def _ensure_ffmpeg_available() -> str:
 _config = {
     "dji_prefix": "DJI_",           # Konfigurierbares DJI-Präfix
     "color_threshold": 0.08,        # Schwelle für Farbsprung-Erkennung (0.0–1.0)
-    "color_profile": "none",        # none, dlogm, whitebalance, both
+    "color_profile": "none",        # none, colorcorrect, dlogm, whitebalance, both
     "codec": "hevc",                # hevc, h264, copy
     "hwaccel": "auto",              # auto, nvenc, amf, qsv, videotoolbox, cpu
     "update_checked": False,        # Ob Update-Check beim Start erfolgte
@@ -1940,7 +1946,7 @@ def _merge_group(
 
     # ── Detect D-Log M ────────────────────────────────────────────
     is_dlog_m = False
-    if cp in ("dlogm", "both"):
+    if cp in ("colorcorrect", "dlogm", "both"):
         ffprobe_bin = _find_ffprobe(ffmpeg_bin=ffmpeg_bin)
         log.info("  Prüfe auf D-Log M Farbprofil …")
         is_dlog_m = _detect_dlog_m(valid_segments[0], ffprobe_bin)
@@ -1948,8 +1954,8 @@ def _merge_group(
             log.info("  ✅ D-Log M erkannt – konvertiere zu Rec.709")
         else:
             log.info(
-                "  ⚠️ Video ist nicht D-Log M – "
-                "D-Log M Konvertierung wird übersprungen"
+                "  ℹ️ Kein D-Log M erkannt – "
+                "allgemeine Farbkorrektur wird angewendet"
             )
 
     # ── Determine encoding strategy ───────────────────────────────
@@ -3125,9 +3131,9 @@ WEB_HTML_TEMPLATE = """<!DOCTYPE html>
           <label>🎨 Farbprofil</label>
           <select id="color-profile">
             <option value="none">Keine (verlustfrei)</option>
-            <option value="dlogm">D-Log M → Rec.709</option>
+            <option value="colorcorrect">Farbkorrektur (auto)</option>
             <option value="whitebalance">Weißabgleich</option>
-            <option value="both">D-Log M + Weißabgleich (empfohlen)</option>
+            <option value="both">Farbkorrektur + Weißabgleich (empfohlen)</option>
           </select>
         </div>
         <div class="settings-item">
@@ -3671,8 +3677,8 @@ Beispiele:
   flipsisitch --overwrite --force .        # bestehende Dateien überschreiben
   flipsisitch --web                        # Web-UI im Browser starten
   flipsisitch --web --port 9000            # Web-UI auf Port 9000
-  flipsisitch --color-profile both --force .  # D-Log M + Weißabgleich
-  flipsisitch --color-profile dlogm --codec h264 --hwaccel nvenc --force .
+  flipsisitch --color-profile both --force .  # Farbkorrektur + Weißabgleich
+  flipsisitch --color-profile colorcorrect --codec h264 --hwaccel nvenc --force .
   flipsisitch --check-update               # Auf Updates prüfen
   flipsisitch --update                     # Auf neueste Version updaten
         """,
@@ -3753,9 +3759,10 @@ Beispiele:
         "--color-profile",
         type=str,
         default="none",
-        choices=["none", "dlogm", "whitebalance", "both"],
-        help="Farbkorrektur-Profil: none, dlogm (D-Log M→Rec.709), "
-             "whitebalance (Weißabgleich), both (beides, empfohlen). Default: none",
+        choices=["none", "colorcorrect", "dlogm", "whitebalance", "both"],
+        help="Farbkorrektur-Profil: none, colorcorrect (universell, erkennt D-Log M automatisch), "
+             "dlogm (Alias für colorcorrect), whitebalance (Weißabgleich), "
+             "both (Farbkorrektur + Weißabgleich, empfohlen). Default: none",
     )
     parser.add_argument(
         "--test-color",

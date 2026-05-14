@@ -6,13 +6,13 @@
 
 **Lossless video segment merging – with color correction, GPU acceleration & modern web UI**
 
-DJI cameras (Osmo Action 5 Pro, Pocket 4, drones) intentionally split long recordings into multiple files – reportedly for file safety. FlipsiStitch automatically detects these segments and merges them losslessly into a single file.
+Many cameras (DJI, GoPro, Sony, Canon and others) automatically split long recordings into multiple files – often due to file system or safety limitations. FlipsiStitch detects these segments regardless of manufacturer and merges them losslessly into a single file.
 
 ## ✨ Features
 
 - 🎬 **Auto Segment Detection** – Recognizes DJI, GoPro and any camera by sequential numbering
 - 🔗 **Lossless Merging** – ffmpeg concat demuxer with `-c copy` (no re-encoding)
-- 🎨 **Color Correction** – D-Log M → Rec.709, auto white balance, or both combined
+- 🎨 **Color Correction** – General color correction for any footage, incl. D-Log M → Rec.709; auto white balance for all videos
 - ⚡ **GPU Acceleration** – NVENC (NVIDIA), AMF (AMD), QSV (Intel), VideoToolbox (Mac)
 - 📦 **H.265/HEVC** – Modern codec standard for re-encoded output, ~40% smaller files
 - 🖥️ **Modern Web UI** – Dark mode, glassmorphism, drag & drop, live progress
@@ -45,14 +45,16 @@ FlipsiStitch offers three correction profiles:
 | Profile | Description | Re-Encoding |
 |---------|-------------|-------------|
 | **None** (Default) | Lossless, no changes | No (`-c copy`) |
-| **D-Log M → Rec.709** | Converts DJI D-Log M to normal color space | Yes (H.265) |
-| **White Balance** | Auto white balance (grayworld) | Yes (H.265) |
-| **D-Log M + White Balance** | Both combined (recommended) | Yes (H.265) |
+| **Color Correction** | Color correction for all footage – auto-detects D-Log M and applies the appropriate conversion; regular footage is corrected too | Yes (H.265) |
+| **White Balance** | Auto white balance for any recording (grayworld algorithm) | Yes (H.265) |
+| **Color Correction + White Balance** | Both combined – optimal colors for every video (recommended) | Yes (H.265) |
 
 ### Safety
 
-- D-Log M conversion is **only applied** when the video actually contains D-Log M (auto-detected via ffprobe)
-- White balance has sanity checks – skipped if results are unreliable
+- Color correction works with **any** video – regardless of camera or color profile
+- D-Log M conversion is **auto-detected** and applied when present; otherwise a general color correction is applied
+- White balance works for **all recordings** (grayworld algorithm) – not limited to specific cameras
+- Sanity checks prevent incorrect corrections – white balance is skipped if results are unreliable
 - `--test-color` extracts frames BEFORE/AFTER correction for comparison
 
 ## ⚡ GPU Acceleration
