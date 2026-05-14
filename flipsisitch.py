@@ -1,6 +1,23 @@
 #!/usr/bin/env python3
+#
+# FlipsiStitch – Verlustfreies Zusammenfügen von Videosegmenten mit Web-UI
+# Copyright (C) 2026 Fabian Kirchweger
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <https://www.gnu.org/licenses/>.
+#
 """
-FlipsiStitch – Verlustfreies Zusammenfügen von DJI-Videosegmenten mit Web-UI.
+FlipsiStitch – Verlustfreies Zusammenfügen von Videosegmenten mit Web-UI.
 
 DJI-Kameras (Osmo Action, Pocket-Serie, Drohnen) splitten lange Videos
 wegen des FAT32/4GB-Dateisystemlimits in mehrere Segmente (z.B.
@@ -65,6 +82,9 @@ except ImportError:
     _HAS_URLPARSE = False
 
 __version__ = "0.1.0"
+__author__ = "Fabian Kirchweger"
+__license__ = "GPL-3.0-or-later"
+__copyright__ = "Copyright (C) 2026 Fabian Kirchweger"
 
 log = logging.getLogger("flipsisitch")
 
@@ -443,6 +463,480 @@ def _get_color_filter_chain(color_profile: str, is_dlog_m: bool) -> str:
         filters.append(_get_whitebalance_filter())
 
     return ",".join(filters)
+
+
+# ---------------------------------------------------------------------------
+# Audio-Normalisierung (EBU R128)
+# ---------------------------------------------------------------------------
+
+def _normalize_audio_loudnorm(
+    input_path: Path,
+    ffmpeg_bin: str = "ffmpeg",
+) -> str:
+    """Zwei-Pass LUFS-Normalisierung (EBU R128).
+
+    Pass 1: Lautstärke messen.
+    Pass 2: Filter-String für Normalisierung zurückgeben.
+
+    Returns ffmpeg -af filter string for pass 2, or empty string if measurement fails.
+    """
+    # ── Pass 1: Lautstärke messen ────────────────────────────────
+    cmd_measure = [
+        ffmpeg_bin, "-i", str(input_path),
+        "-af", "loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json",
+        "-f", "null", "-",
+    ]
+
+    try:
+        result = subprocess.run(
+            cmd_measure,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+        log.warning("  ⚠️ Loudnorm-Messung fehlgeschlagen: %s", exc)
+        return ""
+
+    # JSON aus stderr extrahieren (letzte geschweifte Klammer)
+    stderr = result.stderr
+    json_start = stderr.rfind("{")
+    json_end = stderr.rfind("}")
+
+    if json_start == -1 or json_end == -1 or json_end < json_start:
+        log.warning("  ⚠️ Loudnorm: Kein JSON in ffmpeg-Ausgabe gefunden")
+        return ""
+
+    try:
+        loud_data = json.loads(stderr[json_start:json_end + 1])
+    except json.JSONDecodeError:
+        log.warning("  ⚠️ Loudnorm: JSON konnte nicht geparst werden")
+        return ""
+
+    measured_i = loud_data.get("input_i", "0")
+    measured_tp = loud_data.get("input_tp", "0")
+    measured_lra = loud_data.get("input_lra", "0")
+    measured_thresh = loud_data.get("input_thresh", "0")
+    target_offset = loud_data.get("target_offset", "0")
+
+    log.debug(
+        "  Loudnorm-Messung: I=%s, TP=%s, LRA=%s, Thresh=%s, Offset=%s",
+        measured_i, measured_tp, measured_lra, measured_thresh, target_offset,
+    )
+
+    # ── Filter-String für Pass 2 generieren ──────────────────────
+    af_filter = (
+        f"loudnorm=I=-16:TP=-1.5:LRA=11:"
+        f"measured_I={measured_i}:"
+        f"measured_TP={measured_tp}:"
+        f"measured_LRA={measured_lra}:"
+        f"measured_thresh={measured_thresh}:"
+        f"offset={target_offset}:"
+        f"linear=true:print_format=json"
+    )
+
+    return af_filter
+
+
+# ---------------------------------------------------------------------------
+# Auto-Rotation
+# ---------------------------------------------------------------------------
+
+def _detect_rotation(filepath: Path, ffprobe_bin: Optional[str] = None) -> int:
+    """Video-Rotation aus Metadaten auslesen.
+
+    Returns: 0, 90, 180, or 270 (Grad)
+    """
+    fp_bin = ffprobe_bin or "ffprobe"
+
+    # Mehrere Erkennungsmethoden ausprobieren
+    checks = [
+        # Side data (Display Matrix)
+        [fp_bin, "-v", "quiet", "-show_entries", "side_data=rotation",
+         "-of", "csv=p=0", str(filepath)],
+        # Stream rotation (älteres Format)
+        [fp_bin, "-v", "quiet", "-show_entries", "stream=rotation",
+         "-of", "csv=p=0", str(filepath)],
+        # Stream tags rotate
+        [fp_bin, "-v", "quiet", "-show_entries", "stream_tags=rotate",
+         "-of", "csv=p=0", str(filepath)],
+    ]
+
+    for cmd in checks:
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+            output = result.stdout.strip()
+            if output and output not in ("", "N/A", "0"):
+                rotation = int(float(output))
+                if rotation in (0, 90, 180, 270):
+                    return rotation
+                # Normalisieren auf 0/90/180/270
+                rotation = ((rotation % 360 + 360) % 360)
+                if rotation > 45 and rotation <= 135:
+                    return 90
+                elif rotation > 135 and rotation <= 225:
+                    return 180
+                elif rotation > 225 and rotation <= 315:
+                    return 270
+                else:
+                    return 0
+            elif output == "0":
+                return 0
+        except (subprocess.TimeoutExpired, FileNotFoundError, ValueError):
+            continue
+
+    # Zusätzlich: displayaspectratio prüfen als Indiz für 90°/270°
+    try:
+        cmd_dar = [
+            fp_bin, "-v", "quiet", "-show_entries",
+            "stream=display_aspect_ratio",
+            "-of", "csv=p=0", str(filepath),
+        ]
+        dar_result = subprocess.run(cmd_dar, capture_output=True, text=True, timeout=15)
+        dar_output = dar_result.stdout.strip()
+        if dar_output and dar_output != "N/A":
+            parts = dar_output.split(":")
+            if len(parts) == 2:
+                try:
+                    w_ratio = float(parts[0])
+                    h_ratio = float(parts[1])
+                    # Wenn DAR auf vertikales Video hindeutet (z.B. 9:16 statt 16:9)
+                    if h_ratio > 0 and w_ratio / h_ratio < 0.7:
+                        meta = _get_video_metadata(filepath)
+                        if meta and meta.get("width", 0) > meta.get("height", 9999):
+                            return 90
+                except (ValueError, ZeroDivisionError):
+                    pass
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+
+    return 0
+
+
+def _get_auto_rotate_filter(rotation: int) -> str:
+    """ffmpeg-Filter für Auto-Rotation.
+
+    Returns: ffmpeg filter string
+    - 90° → transpose=1
+    - 180° → hflip,vflip
+    - 270° → transpose=2
+    - 0° → '' (kein Filter nötig)
+    """
+    if rotation == 90:
+        return "transpose=1"
+    elif rotation == 180:
+        return "hflip,vflip"
+    elif rotation == 270:
+        return "transpose=2"
+    else:
+        return ""
+
+
+# ---------------------------------------------------------------------------
+# Deinterlacing
+# ---------------------------------------------------------------------------
+
+def _detect_interlaced(filepath: Path, ffprobe_bin: Optional[str] = None) -> bool:
+    """Prüfen ob Video interlaced ist.
+
+    Checks: field_order in ffprobe metadata.
+    Returns True if interlaced.
+    """
+    fp_bin = ffprobe_bin or "ffprobe"
+
+    try:
+        cmd = [
+            fp_bin, "-v", "quiet", "-show_entries",
+            "stream=field_order", "-of", "csv=p=0", str(filepath),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        field_order = result.stdout.strip().lower()
+
+        if field_order in ("tt", "bb", "tb", "bt"):
+            return True
+        # progressive oder leer = nicht interlaced
+        return False
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return False
+
+
+def _get_deinterlace_filter() -> str:
+    """yadif Deinterlacing-Filter."""
+    return "yadif=0"
+
+
+# ---------------------------------------------------------------------------
+# Resolution-Scaling
+# ---------------------------------------------------------------------------
+
+def _get_scale_filter(resolution: str) -> str:
+    """ffmpeg scale-Filter für Zielauflösung.
+
+    Args:
+        resolution: "original", "4k", "1080p", "720p"
+
+    Returns: ffmpeg filter string or '' for original
+    """
+    targets = {
+        "4k": (3840, 2160),
+        "1080p": (1920, 1080),
+        "720p": (1280, 720),
+    }
+
+    if resolution in targets:
+        w, h = targets[resolution]
+        return (
+            f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
+            f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2"
+        )
+
+    return ""
+
+
+# ---------------------------------------------------------------------------
+# Schärfen (Unsharp Mask)
+# ---------------------------------------------------------------------------
+
+def _get_sharpen_filter() -> str:
+    """Subtiler Schärfungs-Filter (Unsharp Mask).
+
+    Konservative Werte für natürliches Ergebnis:
+    Luma: 5:5:0.8 (subtil)
+    """
+    return "unsharp=5:5:0.8"
+
+
+# ---------------------------------------------------------------------------
+# Thumbnail-Extraktion
+# ---------------------------------------------------------------------------
+
+def _extract_thumbnail(
+    input_path: Path,
+    output_path: Path,
+    ffmpeg_bin: str = "ffmpeg",
+    position_percent: float = 0.1,
+) -> bool:
+    """Thumbnail aus Video extrahieren.
+
+    Args:
+        input_path: Video-Datei
+        output_path: Ausgabe-Pfad für JPG (z.B. merged/thumb.jpg)
+        ffmpeg_bin: Pfad zu ffmpeg
+        position_percent: Position im Video (0.1 = 10%)
+
+    Returns: True bei Erfolg
+    """
+    # Videolänge ermitteln
+    duration = None
+    try:
+        cmd_dur = [
+            ffmpeg_bin.replace("ffmpeg", "ffprobe") if ffmpeg_bin.endswith("ffmpeg") else "ffprobe",
+            "-v", "quiet", "-show_entries", "format=duration",
+            "-of", "csv=p=0", str(input_path),
+        ]
+        dur_result = subprocess.run(cmd_dur, capture_output=True, text=True, timeout=15)
+        dur_str = dur_result.stdout.strip()
+        if dur_str and dur_str != "N/A":
+            duration = float(dur_str)
+    except (subprocess.TimeoutExpired, FileNotFoundError, ValueError):
+        pass
+
+    if duration is None or duration <= 0:
+        log.warning("  ⚠️ Thumbnail: Videolänge konnte nicht ermittelt werden")
+        return False
+
+    # Position berechnen (min. 1 Sekunde vom Anfang)
+    seek_pos = max(duration * position_percent, 1.0)
+
+    # Thumbnail extrahieren
+    cmd = [
+        ffmpeg_bin, "-y",
+        "-ss", str(seek_pos),
+        "-i", str(input_path),
+        "-vframes", "1",
+        "-q:v", "2",
+        str(output_path),
+    ]
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=30)
+        if result.returncode == 0 and output_path.exists():
+            return True
+        log.warning("  ⚠️ Thumbnail-Extraktion: ffmpeg RC=%d", result.returncode)
+        return False
+    except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+        log.warning("  ⚠️ Thumbnail-Extraktion fehlgeschlagen: %s", exc)
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Stabilisierung (Experimentell – vidstabdetect/vidstabtransform)
+# ---------------------------------------------------------------------------
+
+def _analyze_stabilization(
+    input_path: Path,
+    ffmpeg_bin: str = "ffmpeg",
+    tmpdir: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Stabilisierung eines Videos analysieren (vidstabdetect).
+
+    Returns dict with:
+        - 'needed': bool – ob Stabilisierung nötig ist
+        - 'shakiness': float – ermittelter Shake-Wert (0-10)
+        - 'crop_percent': float – wie viel %% beschnitten werden müssten
+        - 'trf_file': Path – Pfad zur Transformationsdatei
+        - 'skip_reason': str oder None – warum übersprungen
+    """
+    if tmpdir is None:
+        tmpdir = Path(tempfile.mkdtemp(prefix="flipsisitch_stab_"))
+
+    trf_file = tmpdir / f"{input_path.stem}_stab.trf"
+
+    # ── Pass 1: Bewegung analysieren (vidstabdetect) ─────────────
+    cmd_detect = [
+        ffmpeg_bin, "-i", str(input_path),
+        "-vf", f"vidstabdetect=shakiness=5:result={trf_file}",
+        "-f", "null", "-",
+    ]
+
+    shakiness = 0.0
+    crop_percent = 0.0
+
+    try:
+        result = subprocess.run(
+            cmd_detect, capture_output=True, text=True, timeout=300,
+        )
+    except subprocess.TimeoutExpired:
+        return {
+            "needed": False,
+            "shakiness": 0,
+            "crop_percent": 0,
+            "trf_file": trf_file,
+            "skip_reason": "Timeout bei Stabilisierungs-Analyse",
+        }
+    except FileNotFoundError:
+        return {
+            "needed": False,
+            "shakiness": 0,
+            "crop_percent": 0,
+            "trf_file": trf_file,
+            "skip_reason": "ffmpeg nicht verfügbar",
+        }
+
+    # Prüfen ob vidstab-Filter verfügbar ist (Fehler in stderr)
+    stderr_lower = result.stderr.lower()
+    if "no such filter" in stderr_lower or "not found" in stderr_lower:
+        return {
+            "needed": False,
+            "shakiness": 0,
+            "crop_percent": 0,
+            "trf_file": trf_file,
+            "skip_reason": "vidstab-Filter nicht im ffmpeg-Build verfügbar",
+        }
+
+    # ── trf-Datei analysieren ────────────────────────────────────
+    if not trf_file.exists():
+        return {
+            "needed": False,
+            "shakiness": 0,
+            "crop_percent": 0,
+            "trf_file": trf_file,
+            "skip_reason": "Transformationsdatei wurde nicht erstellt",
+        }
+
+    try:
+        with open(trf_file, "r") as f:
+            lines = f.readlines()
+
+        total_dx = 0.0
+        total_dy = 0.0
+        max_dx = 0.0
+        max_dy = 0.0
+        count = 0
+
+        for line in lines:
+            parts = line.strip().split()
+            if len(parts) >= 7:
+                try:
+                    dx = abs(float(parts[0]))
+                    dy = abs(float(parts[1]))
+                    total_dx += dx
+                    total_dy += dy
+                    max_dx = max(max_dx, dx)
+                    max_dy = max(max_dy, dy)
+                    count += 1
+                except ValueError:
+                    continue
+
+        if count == 0:
+            return {
+                "needed": False,
+                "shakiness": 0,
+                "crop_percent": 0,
+                "trf_file": trf_file,
+                "skip_reason": "Keine Bewegungsdaten in trf-Datei",
+            }
+
+        # Durchschnittliche Bewegung pro Frame
+        avg_movement = (total_dx + total_dy) / count
+        max_movement = max(max_dx, max_dy)
+
+        # Shakiness auf Skala 0-10 normalisieren
+        shakiness = min(avg_movement / 5.0 * 10, 10.0)
+
+        # Crop-Abschätzung basierend auf max. Bewegung
+        meta = _get_video_metadata(input_path)
+        if meta:
+            frame_w = meta.get("width", 1920)
+            frame_h = meta.get("height", 1080)
+            min_dim = min(frame_w, frame_h)
+            if min_dim > 0:
+                crop_percent = (max_movement / min_dim) * 100 * 4  # Faktor 4 für Sicherheitsmarge
+
+        # Safety-Checks
+        if shakiness < 2.0:
+            return {
+                "needed": False,
+                "shakiness": shakiness,
+                "crop_percent": crop_percent,
+                "trf_file": trf_file,
+                "skip_reason": "Video bereits stabil",
+            }
+
+        if crop_percent > 15.0:
+            return {
+                "needed": False,
+                "shakiness": shakiness,
+                "crop_percent": crop_percent,
+                "trf_file": trf_file,
+                "skip_reason": (
+                    f"Zu viel Bewegung – Crop wäre {crop_percent:.1f}%% "
+                    f"(Limit: 15%%)"
+                ),
+            }
+
+        return {
+            "needed": True,
+            "shakiness": shakiness,
+            "crop_percent": crop_percent,
+            "trf_file": trf_file,
+            "skip_reason": None,
+        }
+
+    except (OSError, ValueError, ZeroDivisionError) as exc:
+        log.warning("  ⚠️ Stabilisierung: Fehler beim Lesen der trf-Datei: %s", exc)
+        return {
+            "needed": False,
+            "shakiness": 0,
+            "crop_percent": 0,
+            "trf_file": trf_file,
+            "skip_reason": f"Fehler beim trf-Parsing: {exc}",
+        }
+
+
+def _get_stabilization_filter(trf_file: Path) -> str:
+    """vidstabtransform Filter-String generieren."""
+    return f"vidstabtransform=smoothing=10:zoom=3:input={trf_file}"
 
 
 # ---------------------------------------------------------------------------
@@ -1008,6 +1502,14 @@ _config = {
     "hwaccel": "auto",              # auto, nvenc, amf, qsv, videotoolbox, cpu
     "update_checked": False,        # Ob Update-Check beim Start erfolgte
     "update_available": None,       # Dict mit Update-Info oder None
+    "normalize_audio": False,       # Audio normalisieren (EBU R128)
+    "auto_rotate": False,           # Auto-Rotation
+    "deinterlace": False,           # Deinterlacing
+    "resolution": "original",       # original, 4k, 1080p, 720p
+    "sharpen": False,               # Schärfen (Unsharp Mask)
+    "thumbnail": False,             # Thumbnail extrahieren
+    "preserve_metadata": True,      # Metadaten erhalten (Default: an)
+    "stabilize": False,             # Stabilisierung (experimentell)
 }
 
 # SSE-Queue für Web-UI Progress (thread-safe)
@@ -1890,6 +2392,15 @@ def _merge_group(
     codec: Optional[str] = None,
     hwaccel: Optional[str] = None,
     tmpdir: Optional[Path] = None,
+    normalize_audio: bool = False,
+    auto_rotate: bool = False,
+    deinterlace: bool = False,
+    resolution: str = "original",
+    sharpen: bool = False,
+    thumbnail: bool = False,
+    preserve_metadata: bool = True,
+    stabilize: bool = False,
+    test_stab: bool = False,
 ) -> bool:
     """Merge a single group of segments, optionally with color correction.
 
@@ -1959,6 +2470,8 @@ def _merge_group(
             )
 
     # ── Determine encoding strategy ───────────────────────────────
+    need_reencode = need_reencode or normalize_audio or auto_rotate or deinterlace or resolution != "original" or sharpen or stabilize
+
     # Check also for legacy color_correct (segment-transition correction)
     color_corrections = []
     if color_correct and not need_reencode:
@@ -1976,24 +2489,101 @@ def _merge_group(
 
     if not need_reencode:
         # No re-encoding needed: lossless concat
-        return _merge_concat(valid_segments, ffmpeg_bin, out_path, overwrite)
+        success = _merge_concat(
+            valid_segments, ffmpeg_bin, out_path, overwrite,
+            preserve_metadata=preserve_metadata,
+        )
+        # ── Thumbnail extrahieren (auch bei verlustfreiem Merge) ──
+        if thumbnail and success and out_path.exists():
+            thumb_dir = out_path.parent
+            thumb_path = thumb_dir / f"{out_path.stem}_thumb.jpg"
+            if _extract_thumbnail(out_path, thumb_path, ffmpeg_bin):
+                log.info("  🖼️ Thumbnail gespeichert: %s", thumb_path.name)
+            else:
+                log.warning("  ⚠️ Thumbnail-Extraktion fehlgeschlagen")
+        return success
 
-    # ── Build color filter chain ──────────────────────────────────
+    # ── Video-Filter-Kette aufbauen ───────────────────────────────
+    video_filters = []
+    ffprobe_bin = _find_ffprobe(ffmpeg_bin=ffmpeg_bin)
+
+    # Auto-Rotation
+    if auto_rotate:
+        rotation = _detect_rotation(valid_segments[0], ffprobe_bin)
+        if rotation != 0:
+            log.info("  🔄 Auto-Rotation: %d° erkannt", rotation)
+            video_filters.append(_get_auto_rotate_filter(rotation))
+
+    # Deinterlacing
+    if deinterlace:
+        is_interlaced = _detect_interlaced(valid_segments[0], ffprobe_bin)
+        if is_interlaced:
+            log.info("  🎞️ Deinterlacing angewendet (yadif)")
+            video_filters.append(_get_deinterlace_filter())
+        else:
+            log.info("  ℹ️ Video ist bereits progressiv – Deinterlacing übersprungen")
+
+    # Stabilisierung
+    stab_info = None
+    if stabilize:
+        log.info("  📹 Analysiere Stabilisierung …")
+        if tmpdir is None:
+            tmpdir = Path(tempfile.mkdtemp(prefix="flipsisitch_"))
+        stab_info = _analyze_stabilization(valid_segments[0], ffmpeg_bin, tmpdir)
+        if stab_info.get("needed"):
+            video_filters.append(_get_stabilization_filter(stab_info["trf_file"]))
+            log.info("  ✅ Stabilisierung: Shake=%.1f, Crop=%.1f%%",
+                     stab_info.get("shakiness", 0), stab_info.get("crop_percent", 0))
+        else:
+            log.info("  ⚠️ Stabilisierung übersprungen: %s", stab_info.get("skip_reason", "?"))
+
+    # Resolution-Scaling
+    if resolution != "original":
+        log.info("  📐 Auflösung: %s", resolution)
+        video_filters.append(_get_scale_filter(resolution))
+
+    # Farbfilter (bestehend)
     color_filter = ""
     if cp != "none":
         color_filter = _get_color_filter_chain(cp, is_dlog_m)
+    if color_filter:
+        video_filters.append(color_filter)
+
+    # Schärfen
+    if sharpen:
+        log.info("  🔍 Schärfen angewendet")
+        video_filters.append(_get_sharpen_filter())
+
+    # Alle Video-Filter kombinieren
+    vf_chain = ",".join(f for f in video_filters if f)
+
+    if vf_chain:
+        log.info("  Video-Filter: %s", vf_chain)
 
     # ── Merge with re-encoding ────────────────────────────────────
-    return _merge_with_reencoding(
+    success = _merge_with_reencoding(
         segments=valid_segments,
         ffmpeg_bin=ffmpeg_bin,
         out_path=out_path,
         overwrite=overwrite,
-        color_filter=color_filter,
+        color_filter=vf_chain,
         corrections=color_corrections if color_correct else [],
         codec=use_codec,
         hwaccel=best_gpu,
+        normalize_audio=normalize_audio,
+        preserve_metadata=preserve_metadata,
     )
+
+    # ── Thumbnail extrahieren ──────────────────────────────────────
+    if thumbnail and success and out_path.exists():
+        thumb_dir = out_path.parent
+        thumb_path = thumb_dir / f"{out_path.stem}_thumb.jpg"
+        if _extract_thumbnail(out_path, thumb_path, ffmpeg_bin):
+            log.info("  🖼️ Thumbnail gespeichert: %s", thumb_path.name)
+        else:
+            log.warning("  ⚠️ Thumbnail-Extraktion fehlgeschlagen")
+
+    return success
 
 
 def _merge_concat(
@@ -2001,6 +2591,7 @@ def _merge_concat(
     ffmpeg_bin: str,
     out_path: Path,
     overwrite: bool,
+    preserve_metadata: bool = True,
 ) -> bool:
     """Standard lossless concat merge (no re-encoding)."""
     with tempfile.NamedTemporaryFile(
@@ -2020,8 +2611,11 @@ def _merge_concat(
             "-i", str(concat_file),
             "-c", "copy",
             "-map", "0",
-            str(out_path),
         ]
+        if preserve_metadata:
+            cmd += ["-map_metadata", "0"]
+        cmd.append(str(out_path))
+
         log.debug("ffmpeg: %s", " ".join(shlex.quote(p) for p in cmd))
 
         proc = subprocess.Popen(
@@ -2062,6 +2656,8 @@ def _merge_with_reencoding(
     corrections: List[Optional[Dict]],
     codec: str,
     hwaccel: str,
+    normalize_audio: bool = False,
+    preserve_metadata: bool = True,
 ) -> bool:
     """Merge segments with re-encoding (color profile, codec, or transition corrections).
 
@@ -2075,7 +2671,7 @@ def _merge_with_reencoding(
              color_filter if color_filter else "none")
 
     if color_filter:
-        log.info("  Farbfilter: %s", color_filter)
+        log.info("  Video-Filter: %s", color_filter)
 
     # Build concat file
     with tempfile.NamedTemporaryFile(
@@ -2091,39 +2687,19 @@ def _merge_with_reencoding(
         is_hevc = codec == "hevc"
         encoder_args = _get_encoder_cmd(codec, hwaccel, is_hevc)
 
-        # Build filter args
-        vf_parts = []
+        # ── Audio-Filter (Normalisierung) ────────────────────────
+        af_filter = ""
+        if normalize_audio:
+            # Zwei-Pass: Erst messen, dann Filter bauen
+            loudnorm_filter = _normalize_audio_loudnorm(segments[0], ffmpeg_bin)
+            if loudnorm_filter:
+                af_filter = loudnorm_filter
+                log.info("  🎙️ Audio-Normalisierung (EBU R128) aktiv")
+            else:
+                log.warning("  ⚠️ Audio-Normalisierung fehlgeschlagen – übersprungen")
 
-        # If there are per-segment corrections, we need a more complex approach
-        has_corrections = any(c is not None for c in corrections)
-
-        if has_corrections:
-            log.info(
-                "  %d Segment-Übergangs-Korrekturen aktiv",
-                sum(1 for c in corrections if c is not None),
-            )
-
-        if color_filter and has_corrections:
-            # Both global color profile AND transition corrections
-            # Apply color filter to all, corrections per segment
-            vf_parts.append(color_filter)
-            # Note: segment-level corrections require separate encoding passes
-            # For now, we combine global filter with corrections
-            for i, corr in enumerate(corrections):
-                if corr is not None:
-                    seg_filter = _generate_color_correction_filter(corr, ffmpeg_bin)
-                    if seg_filter:
-                        vf_parts.append(seg_filter)
-        elif color_filter:
-            vf_parts.append(color_filter)
-        elif has_corrections:
-            for i, corr in enumerate(corrections):
-                if corr is not None:
-                    seg_filter = _generate_color_correction_filter(corr, ffmpeg_bin)
-                    if seg_filter:
-                        vf_parts.append(seg_filter)
-
-        vf_filter = ",".join(vf_parts)
+        # Build filter args - color_filter now contains the full vf chain
+        vf_filter = color_filter
 
         # Build command
         cmd = [
@@ -2137,8 +2713,16 @@ def _merge_with_reencoding(
         if vf_filter:
             cmd += ["-vf", vf_filter]
 
+        if af_filter:
+            cmd += ["-af", af_filter]
+
         cmd += encoder_args
-        cmd += ["-movflags", "+faststart", str(out_path)]
+        cmd += ["-movflags", "+faststart"]
+
+        if preserve_metadata:
+            cmd += ["-map_metadata", "0"]
+
+        cmd.append(str(out_path))
 
         log.debug("ffmpeg: %s", " ".join(shlex.quote(p) for p in cmd))
 
@@ -2194,6 +2778,8 @@ def _merge_with_reencoding(
                     corrections=corrections,
                     codec=codec,
                     hwaccel="cpu",
+                    normalize_audio=normalize_audio,
+                    preserve_metadata=preserve_metadata,
                 )
 
             log.error("ffmpeg-Fehler beim Re-Encoding (RC=%d)", proc.returncode)
@@ -2841,12 +3427,30 @@ function showConfirmDialog () {
   const colorProfile = $('color-profile').value;
   const codec = $('codec-select').value;
   const hwaccel = $('hwaccel-select').value;
+  const normalizeAudio = $('normalize-audio').value;
+  const autoRotate = $('auto-rotate').value;
+  const deinterlace = $('deinterlace').value;
+  const resolution = $('resolution').value;
+  const sharpen = $('sharpen').value;
+  const thumbnail = $('thumbnail').value;
+  const preserveMetadata = $('preserve-metadata').value;
+  const stabilize = $('stabilize').value;
+
+  let extras = '';
+  if (normalizeAudio === '1') extras += '<br><b>Audio-Norm.:</b> Ja';
+  if (autoRotate === '1') extras += '<br><b>Auto-Rotation:</b> Ja';
+  if (deinterlace === '1') extras += '<br><b>Deinterlacing:</b> Ja';
+  if (resolution !== 'original') extras += `<br><b>Auflösung:</b> ${resolution}`;
+  if (sharpen === '1') extras += '<br><b>Schärfen:</b> Ja';
+  if (thumbnail === '1') extras += '<br><b>Thumbnail:</b> Ja';
+  if (preserveMetadata === '0') extras += '<br><b>Metadaten:</b> Nicht erhalten';
+  if (stabilize === '1') extras += '<br><b>⚠️ Stabilisierung:</b> Ja (experimentell)';
 
   let summary = `
     <b>${keys.length} Gruppe(n)</b> mit insgesamt <b>${totalSegs} Segmenten</b><br><br>
     <b>Farbprofil:</b> ${colorProfile}<br>
     <b>Codec:</b> ${codec.toUpperCase()}<br>
-    <b>Hardware:</b> ${hwaccel}<br>
+    <b>Hardware:</b> ${hwaccel}${extras}<br>
     <b>Ausgabe:</b> ${state.output || state.folder + '/merged'}
   `;
 
@@ -2873,6 +3477,14 @@ async function executeMerge () {
   const colorProfile = $('color-profile').value;
   const codec = $('codec-select').value;
   const hwaccel = $('hwaccel-select').value;
+  const normalizeAudio = $('normalize-audio').value;
+  const autoRotate = $('auto-rotate').value;
+  const deinterlace = $('deinterlace').value;
+  const resolution = $('resolution').value;
+  const sharpen = $('sharpen').value;
+  const thumbnail = $('thumbnail').value;
+  const preserveMetadata = $('preserve-metadata').value;
+  const stabilize = $('stabilize').value;
 
   addLog('info', `Merge: Farbprofil=${colorProfile}, Codec=${codec}, GPU=${hwaccel}`);
 
@@ -2885,6 +3497,14 @@ async function executeMerge () {
       color_profile: colorProfile,
       codec: codec,
       hwaccel: hwaccel,
+      normalize_audio: normalizeAudio,
+      auto_rotate: autoRotate,
+      deinterlace: deinterlace,
+      resolution: resolution,
+      sharpen: sharpen,
+      thumbnail: thumbnail,
+      preserve_metadata: preserveMetadata,
+      stabilize: stabilize,
       port: state.port.toString(),
     });
     const data = await api(`/api/merge?${params}`, { method: 'POST' });
@@ -3154,6 +3774,64 @@ WEB_HTML_TEMPLATE = """<!DOCTYPE html>
             <option value="cpu">CPU (Software)</option>
           </select>
         </div>
+        <div class="settings-item">
+          <label>🎙️ Audio normalisieren</label>
+          <select id="normalize-audio">
+            <option value="0">Nein</option>
+            <option value="1">Ja (EBU R128)</option>
+          </select>
+        </div>
+        <div class="settings-item">
+          <label>🔄 Auto-Rotation</label>
+          <select id="auto-rotate">
+            <option value="0">Nein</option>
+            <option value="1">Ja</option>
+          </select>
+        </div>
+        <div class="settings-item">
+          <label>🎞️ Deinterlacing</label>
+          <select id="deinterlace">
+            <option value="0">Nein</option>
+            <option value="1">Ja (yadif)</option>
+          </select>
+        </div>
+        <div class="settings-item">
+          <label>📐 Auflösung</label>
+          <select id="resolution">
+            <option value="original">Original</option>
+            <option value="4k">4K (3840×2160)</option>
+            <option value="1080p">1080p (1920×1080)</option>
+            <option value="720p">720p (1280×720)</option>
+          </select>
+        </div>
+        <div class="settings-item">
+          <label>🔍 Schärfen</label>
+          <select id="sharpen">
+            <option value="0">Nein</option>
+            <option value="1">Ja (Unsharp Mask)</option>
+          </select>
+        </div>
+        <div class="settings-item">
+          <label>🖼️ Thumbnail</label>
+          <select id="thumbnail">
+            <option value="0">Nein</option>
+            <option value="1">Ja (10% Position)</option>
+          </select>
+        </div>
+        <div class="settings-item">
+          <label>🏷️ Metadaten erhalten</label>
+          <select id="preserve-metadata">
+            <option value="1">Ja (empfohlen)</option>
+            <option value="0">Nein</option>
+          </select>
+        </div>
+        <div class="settings-item">
+          <label>⚠️ Stabilisierung (experimentell)</label>
+          <select id="stabilize">
+            <option value="0">Nein</option>
+            <option value="1">Ja</option>
+          </select>
+        </div>
       </div>
     </div>
   </div>
@@ -3348,6 +4026,14 @@ class FlipsiStitchHandler(BaseHTTPRequestHandler):
         color_profile = params.get("color_profile", ["none"])[0]
         codec_str = params.get("codec", ["hevc"])[0]
         hwaccel_str = params.get("hwaccel", ["auto"])[0]
+        normalize_audio = params.get("normalize_audio", ["0"])[0] == "1"
+        auto_rotate = params.get("auto_rotate", ["0"])[0] == "1"
+        deinterlace = params.get("deinterlace", ["0"])[0] == "1"
+        resolution = params.get("resolution", ["original"])[0]
+        sharpen = params.get("sharpen", ["0"])[0] == "1"
+        thumbnail = params.get("thumbnail", ["0"])[0] == "1"
+        preserve_metadata = params.get("preserve_metadata", ["1"])[0] == "1"
+        stabilize = params.get("stabilize", ["0"])[0] == "1"
         # Legacy param support
         color_correct = params.get("color_correct", ["0"])[0] == "1"
         threshold_str = params.get("threshold", ["0.08"])[0]
@@ -3364,6 +4050,14 @@ class FlipsiStitchHandler(BaseHTTPRequestHandler):
         _config["color_profile"] = color_profile
         _config["codec"] = codec_str
         _config["hwaccel"] = hwaccel_str
+        _config["normalize_audio"] = normalize_audio
+        _config["auto_rotate"] = auto_rotate
+        _config["deinterlace"] = deinterlace
+        _config["resolution"] = resolution
+        _config["sharpen"] = sharpen
+        _config["thumbnail"] = thumbnail
+        _config["preserve_metadata"] = preserve_metadata
+        _config["stabilize"] = stabilize
 
         folder = Path(folder_str).expanduser().resolve()
         if not folder.is_dir():
@@ -3411,6 +4105,14 @@ class FlipsiStitchHandler(BaseHTTPRequestHandler):
                     color_profile=color_profile,
                     codec=codec_str,
                     hwaccel=hwaccel_str,
+                    normalize_audio=normalize_audio,
+                    auto_rotate=auto_rotate,
+                    deinterlace=deinterlace,
+                    resolution=resolution,
+                    sharpen=sharpen,
+                    thumbnail=thumbnail,
+                    preserve_metadata=preserve_metadata,
+                    stabilize=stabilize,
                 )
 
                 if success and out_path.exists():
@@ -3799,6 +4501,54 @@ Beispiele:
         help="Hardware-Beschleunigung: auto, nvenc (NVIDIA), "
              "amf (AMD), qsv (Intel), videotoolbox (Apple), cpu. Default: auto",
     )
+    # ── Video Quality ──────────────────────────────────────────────
+    parser.add_argument(
+        "--normalize-audio",
+        action="store_true",
+        help="Audio normalisieren (EBU R128, Zwei-Pass LUFS)",
+    )
+    parser.add_argument(
+        "--auto-rotate",
+        action="store_true",
+        help="Video automatisch korrekt rotieren",
+    )
+    parser.add_argument(
+        "--deinterlace",
+        action="store_true",
+        help="Deinterlacing anwenden (yadif, automatisch bei interlaced)",
+    )
+    parser.add_argument(
+        "--resolution",
+        type=str,
+        default="original",
+        choices=["original", "4k", "1080p", "720p"],
+        help="Zielauflösung: original (keine Skalierung), 4k, 1080p, 720p. Default: original",
+    )
+    parser.add_argument(
+        "--sharpen",
+        action="store_true",
+        help="Leichtes Schärfen (Unsharp Mask)",
+    )
+    parser.add_argument(
+        "--thumbnail",
+        action="store_true",
+        help="Thumbnail aus dem Video extrahieren (10%% Position)",
+    )
+    parser.add_argument(
+        "--no-preserve-metadata",
+        action="store_true",
+        help="Metadaten NICHT erhalten (Standard: Metadaten werden erhalten)",
+    )
+    parser.add_argument(
+        "--stabilize",
+        action="store_true",
+        help="⚠️ Experimentell: Video stabilisieren (vidstab, konservative Einstellungen)",
+    )
+    parser.add_argument(
+        "--test-stab",
+        action="store_true",
+        help="Stabilisierungs-Analyse ohne Merge (zeigt Shake-Wert und Crop-Prozent)",
+    )
     # ── Update ─────────────────────────────────────────────────────
     parser.add_argument(
         "--check-update",
@@ -3853,6 +4603,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     _config["color_profile"] = args.color_profile
     _config["codec"] = args.codec
     _config["hwaccel"] = args.hwaccel
+    _config["normalize_audio"] = args.normalize_audio
+    _config["auto_rotate"] = args.auto_rotate
+    _config["deinterlace"] = args.deinterlace
+    _config["resolution"] = args.resolution
+    _config["sharpen"] = args.sharpen
+    _config["thumbnail"] = args.thumbnail
+    _config["preserve_metadata"] = not args.no_preserve_metadata
+    _config["stabilize"] = args.stabilize
 
     # ── logging setup ──────────────────────────────────────────────
     level = logging.DEBUG if args.verbose else logging.INFO
@@ -3943,6 +4701,26 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"\n   Temp-Dateien in: {tmpdir}")
         return 0
 
+    # ── Test stabilization mode ───────────────────────────────────
+    if args.test_stab:
+        files = _scan_folder(folder)
+        if not files:
+            print(f"⚠️  Keine Videodateien in: {folder}")
+            return 1
+        sample = files[0]
+        print(f"📹 Analysiere Stabilisierung: {sample.name}")
+        tmpdir = Path(tempfile.mkdtemp(prefix="flipsisitch_stab_"))
+        stab_info = _analyze_stabilization(sample, ffmpeg_bin, tmpdir)
+        print(f"   Stabilisierung nötig: {'Ja ✅' if stab_info.get('needed') else 'Nein ❌'}")
+        print(f"   Shake-Wert: {stab_info.get('shakiness', 'N/A')}")
+        print(f"   Crop-Prozent: {stab_info.get('crop_percent', 'N/A'):.1f}%")
+        if stab_info.get('skip_reason'):
+            print(f"   ⚠️ Übersprungen: {stab_info['skip_reason']}")
+        if stab_info.get('trf_file'):
+            print(f"   Transformationsdatei: {stab_info['trf_file']}")
+        print(f"\n   Temp-Dateien in: {tmpdir}")
+        return 0
+
     # ── scan ───────────────────────────────────────────────────────
     try:
         files = _scan_folder(folder)
@@ -3987,9 +4765,28 @@ def main(argv: Optional[List[str]] = None) -> int:
             cp = args.color_profile
             codec = args.codec
             hw = args.hwaccel
-            corr_note = ""
+            extras = []
             if cp != "none" or args.color_correct:
-                corr_note = f" (Farbprofil={cp}, Codec={codec}, Hardware={hw})"
+                extras.append(f"Farbprofil={cp}")
+            extras.append(f"Codec={codec}")
+            extras.append(f"Hardware={hw}")
+            if args.normalize_audio:
+                extras.append("Audio-Norm.")
+            if args.auto_rotate:
+                extras.append("Auto-Rotation")
+            if args.deinterlace:
+                extras.append("Deinterlace")
+            if args.resolution != "original":
+                extras.append(f"Auflösung={args.resolution}")
+            if args.sharpen:
+                extras.append("Schärfen")
+            if args.thumbnail:
+                extras.append("Thumbnail")
+            if not args.no_preserve_metadata:
+                extras.append("Metadaten")
+            if args.stabilize:
+                extras.append("⚠️Stabilisierung")
+            corr_note = f" ({', '.join(extras)})" if extras else ""
             print(f"  → Würde erzeugen: {out}{corr_note}")
         print(f"\n📊 {len(groups)} Gruppe(n), keine Änderungen vorgenommen.")
         return 0
@@ -4007,6 +4804,24 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"🎨 Farbprofil: {args.color_profile}")
     print(f"📹 Codec: {args.codec}")
     print(f"⚡ Hardware: {gpu_label}")
+    if args.normalize_audio:
+        print(f"🎙️ Audio-Normalisierung: Ja (EBU R128)")
+    if args.auto_rotate:
+        print(f"🔄 Auto-Rotation: Ja")
+    if args.deinterlace:
+        print(f"🎞️ Deinterlacing: Ja")
+    if args.resolution != "original":
+        print(f"📐 Auflösung: {args.resolution}")
+    if args.sharpen:
+        print(f"🔍 Schärfen: Ja")
+    if args.thumbnail:
+        print(f"🖼️ Thumbnail: Ja")
+    if not args.no_preserve_metadata:
+        print(f"🏷️ Metadaten: Erhalten")
+    else:
+        print(f"🏷️ Metadaten: Nicht erhalten")
+    if args.stabilize:
+        print(f"⚠️ Stabilisierung: Ja (experimentell)")
     print()
 
     if not args.force:
@@ -4033,6 +4848,14 @@ def main(argv: Optional[List[str]] = None) -> int:
             color_profile=args.color_profile,
             codec=args.codec,
             hwaccel=args.hwaccel,
+            normalize_audio=args.normalize_audio,
+            auto_rotate=args.auto_rotate,
+            deinterlace=args.deinterlace,
+            resolution=args.resolution,
+            sharpen=args.sharpen,
+            thumbnail=args.thumbnail,
+            preserve_metadata=not args.no_preserve_metadata,
+            stabilize=args.stabilize,
         )
         if not success:
             errors += 1
